@@ -17,6 +17,8 @@ Hierarchical clustering is widely used for customer segmentation, gene expressio
 
 ## Build and Run
 
+All source code files and the data file (covtype_processed.csv) are located in the Hierarchical Clustering Program directory.
+
 ### Compilation
 
 This project includes a utility file `Point_Utils.h` and its implementation `Point_Utils.cpp` which are required by the main source file `sequential_clustering.cpp`.
