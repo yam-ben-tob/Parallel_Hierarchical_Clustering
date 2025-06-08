@@ -39,7 +39,6 @@ After successfully compiling the program, you can run the executable as follows:
 ./sequential_clustering
 
 ```
-
 By default, the program expects the input CSV file covtype_processed.csv to be located in the same directory as the executable.
 
 ---
