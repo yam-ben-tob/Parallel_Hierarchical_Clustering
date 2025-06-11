@@ -73,98 +73,168 @@ __global__ void initialize_clusters_and_activity(int* d_clusters, bool* d_is_act
     }
 }
 
-__global__ void block_level_min_kernel(const double* d_distances, const bool* d_is_active, int n,
-                                       int* d_block_min_indices, double* d_block_min_values) {
-    extern __shared__ unsigned char shared[];
-    double* s_vals = (double*)shared;
-    int* s_indices = (int*)&s_vals[blockDim.x];
+__global__ void find_local_min_kernel(
+    const double* min_distances,  // [n]
+    const bool* is_active,        // [n]
+    double* d_local_mins,         // [p]
+    int* d_local_indices,         // [p]
+    int n,
+    int p                         // total threads = p
+) {
+    int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (thread_id >= p) return;
 
-    int tid = threadIdx.x;
-    int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // Divide n clusters among p threads
+    int clusters_per_thread = (n + p - 1) / p;
+    int start_cluster = thread_id * clusters_per_thread;
+    int end_cluster = min(start_cluster + clusters_per_thread, n);
 
-    double val = DBL_MAX;
-    int index = -1;
+    double local_min = DBL_MAX;
+    int local_index = -1;
 
-    // Load data from global memory
-    if (global_idx < n && d_is_active[global_idx]) {
-        val = d_distances[global_idx];
-        index = global_idx;
+    for (int i = start_cluster; i < end_cluster; ++i) {
+        if (is_active[i] && min_distances[i] < local_min) {
+            local_min = min_distances[i];
+            local_index = i;
+        }
     }
 
-    s_vals[tid] = val;
-    s_indices[tid] = index;
+    d_local_mins[thread_id] = local_min;
+    d_local_indices[thread_id] = local_index;
+}
+
+__global__ void reduce_min_kernel(
+    const double* in_vals,
+    const int* in_indices,
+    double* out_vals,
+    int* out_indices,
+    int N  // total number of input values
+) {
+    // __shared__: shared among all threads in a block. 
+    // Resides in on-chip memory, much faster than global memory
+    // Preforming reduction using a block of threads over a block of value,
+    // Time complexity: O(log(THREADS_PER_BLOCK)) = O(1) 
+    __shared__ double shared_vals[THREADS_PER_BLOCK];
+    __shared__ int shared_idxs[THREADS_PER_BLOCK];
+
+    int tid = threadIdx.x;
+    int global_id = blockIdx.x * blockDim.x + tid;
+
+    // Load input to shared memory
+    if (global_id < N) {
+        shared_vals[tid] = in_vals[global_id];
+        shared_idxs[tid] = in_indices[global_id];
+    } else {
+        shared_vals[tid] = DBL_MAX;
+        shared_idxs[tid] = -1;
+    }
 
     // Waits until all threads in a block reach this point
     // Ensures shared memory is fully updated and visible to all threads
-    __syncthreads(); 
-
-    // Reduce within block
-    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
-        if (tid < stride) {
-            if (s_vals[tid + stride] < s_vals[tid]) {
-                s_vals[tid] = s_vals[tid + stride];
-                s_indices[tid] = s_indices[tid + stride];
-            }
-        }
-        __syncthreads();
-    }
-
-    // First thread in block writes block min to global memory
-    if (tid == 0) {
-        d_block_min_values[blockIdx.x] = s_vals[0];
-        d_block_min_indices[blockIdx.x] = s_indices[0];
-    }
-}
-
-__global__ void final_min_kernel(const int* d_indices, const double* d_values, int n, int* d_final_index) {
-    extern __shared__ unsigned char shared[];
-    double* s_vals = (double*)shared;
-    int* s_indices = (int*)&s_vals[blockDim.x];
-
-    int tid = threadIdx.x;
-    int global_idx = tid;
-
-    double val = DBL_MAX;
-    int index = -1;
-
-    if (global_idx < n) {
-        val = d_values[global_idx];
-        index = d_indices[global_idx];
-    }
-
-    s_vals[tid] = val;
-    s_indices[tid] = index;
-
     __syncthreads();
 
-    // Reduce
-    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    // Parallel reduction
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
-            if (s_vals[tid + stride] < s_vals[tid]) {
-                s_vals[tid] = s_vals[tid + stride];
-                s_indices[tid] = s_indices[tid + stride];
+            if (shared_vals[tid + stride] < shared_vals[tid]) {
+                shared_vals[tid] = shared_vals[tid + stride];
+                shared_idxs[tid] = shared_idxs[tid + stride];
             }
         }
         __syncthreads();
     }
 
+    // Write block result
     if (tid == 0) {
-        d_final_index[0] = s_indices[0];
+        out_vals[blockIdx.x] = shared_vals[0];
+        out_indices[blockIdx.x] = shared_idxs[0];
+    }
+}
+
+__global__ void merge_clusters_kernel(
+    int* d_clusters,     // [n]
+    bool* d_is_active,   // [n]
+    int old_cluster,
+    int new_cluster,
+    int n,
+    int p                // total number of threads
+) {
+    int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (thread_id >= p) return;
+
+    // Compute the range this thread is responsible for
+    int clusters_per_thread = (n + p - 1) / p;  
+    int start = thread_id * clusters_per_thread;
+    int end = min(start + clusters_per_thread, n);
+
+    // Each thread processes its portion
+    for (int i = start; i < end; ++i) {
+        if (d_clusters[i] == old_cluster) {
+            d_clusters[i] = new_cluster;
+        }
+    }
+
+    // Let one thread mark old_cluster as inactive
+    if (thread_id == 0) {
+        d_is_active[old_cluster] = false;
     }
 }
 
 
+__global__ void update_distances(
+    double* d_distances,        // [n * n] flattened distance matrix
+    bool* d_is_active,          // [n]
+    int* d_nearest_neighbors,   // [n]
+    double* d_min_distances,    // [n]
+    int old_cluster,
+    int new_cluster,
+    int n,
+    int p                       // total number of threads
+) {
+    int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (thread_id >= p) return;
+
+    // Calculate the range this thread should process
+    int clusters_per_thread = (n + p - 1) / p;
+    int start = thread_id * clusters_per_thread;
+    int end = min(start + clusters_per_thread, n);
+
+    for (int i = start; i < end; ++i) {
+        if (!d_is_active[i] || i == new_cluster) continue;
+
+        double dist_old = d_distances[i * n + old_cluster];
+        double dist_new = d_distances[i * n + new_cluster];
+        double updated_dist = min(dist_old, dist_new);
+
+        d_distances[i * n + new_cluster] = updated_dist;
+        d_distances[new_cluster * n + i] = updated_dist;
+
+        if (d_nearest_neighbors[i] == old_cluster) {
+            d_nearest_neighbors[i] = new_cluster;
+            d_min_distances[i] = updated_dist;
+        }
+
+        // Update nearest neighbor of new_cluster
+        if (d_is_active[i] && i != new_cluster) {
+            double new_dist = d_distances[i * n + new_cluster];
+            if (new_dist < d_min_distances[new_cluster]) {
+                d_min_distances[new_cluster] = new_dist;
+                d_nearest_neighbors[new_cluster] = i;
+            }
+        }
+    }
+}
 
 // Struct to hold GPU data pointers
 struct GpuData {
-    double* d_points = nullptr;
-    double* d_distances = nullptr;
-    int* d_nearest_neighbors = nullptr;  
-    double* d_min_distances = nullptr; 
-    int* d_clusters;
-    bool* d_is_active;  
-    int n = 0;
-    int d = 0;
+    double* d_points = nullptr;         // Flattened input points array (size: n * d)
+    double* d_distances = nullptr;      // distance matrix (size: n * n)
+    int* d_nearest_neighbors = nullptr; // Index of nearest neighbor for each active cluster (size: n) 
+    double* d_min_distances = nullptr;  // distance to nearest neighbor per cluster (size: n)   
+    int* d_clusters;                    // cluster ID for each point (size: n)          
+    bool* d_is_active;                  // flags indicating active clusters (size: n)    
+    int n = 0;                          // Number of points
+    int d = 0;                          // Dimensionality of each point           
 };
 
 
@@ -192,7 +262,9 @@ GpuData initialize_on_gpu(const std::vector<Point>& points, int p) {
 
     // Launch kernel to compute distance matrix
     double* d_weights = nullptr; 
-    int totalThreads = p; // p threads leading to O(n^2/p) time complexity, for p=n/logn we get O(nlog(n)) time complexity
+    // p threads leading to O(n^2/p) time complexity, 
+    // for p=n/logn we get O(nlog(n)) time complexity as needed.
+    int totalThreads = p; // adjust to n^2 and see effect
     int blocks = (totalThreads + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
     compute_distances_gower<<<blocks, THREADS_PER_BLOCK>>>(
         gpu_data.d_points,
@@ -209,7 +281,8 @@ GpuData initialize_on_gpu(const std::vector<Point>& points, int p) {
     cudaMalloc(&d_nearest_neighbors, gpu_data.n * sizeof(int));
     cudaMalloc(&d_min_distances, gpu_data.n * sizeof(double));
 
-    int total_threads = gpu_data.n;
+    // n^2 threads, O(1) time complexity
+    int total_threads = gpu_data.n * gpu_data.n;
     int num_blocks = (total_threads + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
 
     // Launch one thread per point to find its nearest neighbor
@@ -236,91 +309,127 @@ GpuData initialize_on_gpu(const std::vector<Point>& points, int p) {
     return gpu_data;
 }
 
-int find_global_minimum(const double* d_distances, const bool* d_is_active, int n) {
-    int num_blocks = (n + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+int find_global_min(
+    const double* d_min_distances,   // [n]
+    const bool* d_is_active,         // [n]
+    int n,
+    int p,
+) {
+    // Allocate intermediate buffers
+    double* d_local_mins;
+    int* d_local_indices;
+    cudaMalloc(&d_local_mins, p * sizeof(double));
+    cudaMalloc(&d_local_indices, p * sizeof(int));
 
-    // Allocate block-level results
-    int* d_block_min_indices;
-    double* d_block_min_values;
-    cudaMalloc(&d_block_min_indices, num_blocks * sizeof(int));
-    cudaMalloc(&d_block_min_values, num_blocks * sizeof(double));
+    // Launch local min kernel (p threads)
+    int blocks = (p + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    find_local_min_kernel<<<blocks, THREADS_PER_BLOCK>>>(
+        d_min_distances, d_is_active,
+        d_local_mins, d_local_indices,
+        n, p
+    );
 
-    // First kernel: reduce within blocks
-    size_t shared_size = THREADS_PER_BLOCK * (sizeof(double) + sizeof(int));
-    block_level_min_kernel<<<num_blocks, THREADS_PER_BLOCK, shared_size>>>(
-        d_distances, d_is_active, n, d_block_min_indices, d_block_min_values);
-    cudaDeviceSynchronize();
+    // Stage 1 reduction
+    int blocks_stage1 = (p + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    double* d_stage1_mins;
+    int* d_stage1_indices;
+    cudaMalloc(&d_stage1_mins, blocks_stage1 * sizeof(double));
+    cudaMalloc(&d_stage1_indices, blocks_stage1 * sizeof(int));
 
-    // Second kernel: reduce block results to global min
-    int* d_final_index;
-    cudaMalloc(&d_final_index, sizeof(int));
+    reduce_min_kernel<<<blocks_stage1, THREADS_PER_BLOCK>>>(
+        d_local_mins, d_local_indices,
+        d_stage1_mins, d_stage1_indices,
+        p
+    );
 
-    int threads_final = 256;
-    int final_shared_size = threads_final * (sizeof(double) + sizeof(int));
-    final_min_kernel<<<1, threads_final, final_shared_size>>>(
-        d_block_min_indices, d_block_min_values, num_blocks, d_final_index);
-    cudaDeviceSynchronize();
+    // Stage 2 reduction
+    double* d_global_min_val;
+    int* d_global_min_idx;
+    cudaMalloc(&d_global_min_val, sizeof(double));
+    cudaMalloc(&d_global_min_idx, sizeof(int));
+
+    int stage2_threads = 1;
+    while (stage2_threads < blocks_stage1 && stage2_threads < threads_stage1)
+        stage2_threads *= 2;
+
+    reduce_min_kernel<<<1, stage2_threads>>>(
+        d_stage1_mins, d_stage1_indices,
+        d_global_min_val, d_global_min_idx,
+        blocks_stage1
+    );
 
     // Copy result to host
-    int h_final_index;
-    cudaMemcpy(&h_final_index, d_final_index, sizeof(int), cudaMemcpyDeviceToHost);
+    int h_global_min_idx;
+    cudaMemcpy(&h_global_min_idx, d_global_min_idx, sizeof(int), cudaMemcpyDeviceToHost);
 
     // Cleanup
-    cudaFree(d_block_min_indices);
-    cudaFree(d_block_min_values);
-    cudaFree(d_final_index);
+    cudaFree(d_local_mins);
+    cudaFree(d_local_indices);
+    cudaFree(d_stage1_mins);
+    cudaFree(d_stage1_indices);
+    cudaFree(d_global_min_val);
+    cudaFree(d_global_min_idx);
 
-    return h_final_index;
+    return h_global_min_idx; 
+}
+
+void cleanup_gpu_data(GpuData& gpu_data) {
+    cudaFree(gpu_data.d_points);
+    cudaFree(gpu_data.d_distances);
+    cudaFree(gpu_data.d_nearest_neighbors);
+    cudaFree(gpu_data.d_min_distances);
+    cudaFree(gpu_data.d_clusters);
+    cudaFree(gpu_data.d_is_active);
 }
 
 
-void run_single_linkage_clustering(GPUData& gpu_data, int p) {
+int* run_single_linkage_clustering(GPUData& gpu_data, int p) {
     GpuData gpu_data = initialize_on_gpu(points, p);
     
     int blocks = (p + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
 
+    // continue here, 2 rounds of reduction ,max 3, depends on num of threads in a block which have shared memory.
+    // how to split clusters between threads?
+    
     for (int iter = 0; iter < gpu_data.n - 1; ++iter) {
         // Step 1: Find global minimum of min_distances (still on CPU for now)
-        int min_index = find_global_minimum(gpu_data.d_min_distances, gpu_data.d_is_active, gpu_data.n);
-
-        // Step 2: Merge clusters — only one thread needed 
-        merge_clusters<<<1, 1>>>(
-            gpu_data.d_clusters,
-            gpu_data.d_is_active,
-            gpu_data.d_nearest_neighbors,
+        int min_index = find_global_min(gpu_data.d_min_distances, gpu_data.d_is_active, gpu_data.n, p);
+        
+        // Step 2: Merge clusters
+        int new_cluster;
+        cudaMemcpy(&new_cluster, &gpu_data.d_nearest_neighbors[min_index], sizeof(int), cudaMemcpyDeviceToHost);
+        merge_clusters_kernel<<<blocks, THREADS_PER_BLOCK>>>(
+            d_clusters,
+            d_is_active,
             min_index,
-            gpu_data.n
+            new_cluster,
+            gpu_data.n,
+            p
         );
-        cudaDeviceSynchronize();
+        udaDeviceSynchronize();
 
         // Step 3: Update distances to the new cluster (parallel with p threads)
         update_distances<<<blocks, THREADS_PER_BLOCK>>>(
             gpu_data.d_distances,
             gpu_data.d_is_active,
-            min_index,
-            gpu_data.n
-        );
-        cudaDeviceSynchronize();
-
-        // Step 4: Update nearest neighbors (parallel with p threads)
-        update_nearest_neighbors<<<blocks, THREADS_PER_BLOCK>>>(
-            gpu_data.d_distances,
-            gpu_data.d_is_active,
             gpu_data.d_nearest_neighbors,
             gpu_data.d_min_distances,
-            gpu_data.n
+            min_index,
+            new_cluster,
+            gpu_data.n,
+            p  
         );
         cudaDeviceSynchronize();
     }
-
     cudaDeviceSynchronize();
 
-     // Step 3: Copy final clusters and activity arrays back to host if needed
-    std::vector<int> clusters = copy_clusters_to_host(gpu_data);
-    std::vector<bool> activity = copy_activity_to_host(gpu_data);
+     // Step 4: Copy final clusters and activity arrays back to host if needed
+    int* h_clusters = new int[gpu_data.n];
+    cudaMemcpy(h_clusters, gpu_data.d_clusters, gpu_data.n * sizeof(int), cudaMemcpyDeviceToHost);
 
-    // Step 4: Free GPU memory (implement a cleanup function)
+    // Step 5: Free GPU memory 
     cleanup_gpu_data(gpu_data);
 
+    return h_clusters;
 }
 
